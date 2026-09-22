@@ -133,7 +133,7 @@ class _Top10HTMLParser(HTMLParser):
         m = re.search(r"#\s*(10|[1-9])\s+in\s+(Movies|Shows)\b", value, re.I)
         if m and self.last_image_alt:
             self.image_rank_items.append({
-                "title": self.last_image_alt,
+                "title": re.sub(r"^Image:\s*", "", self.last_image_alt, flags=re.I).strip(),
                 "rank": int(m.group(1)),
                 "category": m.group(2).lower(),
             })
@@ -146,7 +146,10 @@ def parse_top10_html(html: str, region: str, media_type: str):
 
     # Netflix currently exposes the selected week in the page text.
     week = None
-    m = re.search(r"(\d{1,2}/\d{1,2}/\d{2})\s*-\s*(\d{1,2}/\d{1,2}/\d{2})", text)
+    m = re.search(
+        r"(\d{1,2}/\d{1,2}/\d{2})\s*[–—-]\s*(\d{1,2}/\d{1,2}/\d{2})",
+        text,
+    )
     if m:
         week = f"{m.group(1)} - {m.group(2)}"
 
