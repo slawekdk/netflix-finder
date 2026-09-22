@@ -1,32 +1,43 @@
 import os
 from typing import Literal, Optional
+
 import httpx
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 TMDB_TOKEN = os.getenv("TMDB_TOKEN")
 TMDB_BASE = "https://api.themoviedb.org/3"
-NETFLIX_PROVIDER_ID = 8  # Netflix in TMDB
+NETFLIX_PROVIDER_ID = 8
 DEFAULT_REGION = os.getenv("DEFAULT_REGION", "DK")
 
 app = FastAPI(
     title="Netflix Finder",
-    version="1.0.0",
-    description="Find Netflix titles by production country, type, rating, vote count and Netflix viewing data."
+    version="1.1.0",
+    description="Find Netflix titles by production country, type, rating, vote count and popularity."
 )
+
+class UTF8JSONMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if response.headers.get("content-type", "").startswith("application/json"):
+            response.headers["content-type"] = "application/json; charset=utf-8"
+        return response
+
+app.add_middleware(UTF8JSONMiddleware)
 
 async def tmdb_get(path: str, params: dict):
     if not TMDB_TOKEN:
         raise HTTPException(500, "TMDB_TOKEN is not configured.")
-    headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/json"}
+    headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "Accept": "application/json"}
     async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(f"{TMDB_BASE}{path}", params=params, headers=headers)
-        r.raise_for_status()
-        return r.json()
+        response = await client.get(f"{TMDB_BASE}{path}", params=params, headers=headers)
+        if response.is_error:
+            raise HTTPException(response.status_code, f"TMDB request failed: HTTP {response.status_code}")
+        return response.json()
 
 def provider_ids(value):
-    if value is None:
-        return None
-    return str(value)
+    return None if value is None else str(value)
 
 @app.get("/health")
 async def health():
@@ -43,13 +54,7 @@ async def search(
     page: int = Query(1, ge=1, le=20),
     limit: int = Query(10, ge=1, le=20),
 ):
-    """Search TMDB titles that are currently listed as Netflix streaming in the selected region."""
-    sort_map = {
-        "rating": "vote_average.desc",
-        "votes": "vote_count.desc",
-        "popularity": "popularity.desc",
-    }
-
+    sort_map = {"rating": "vote_average.desc", "votes": "vote_count.desc", "popularity": "popularity.desc"}
     common = {
         "language": "en-US",
         "watch_region": region.upper(),
@@ -66,21 +71,16 @@ async def search(
 
     if content_type == "movie":
         data = await tmdb_get("/discover/movie", common)
-        items = [{"type":"movie", **x} for x in data.get("results", [])]
+        items = [{"type": "movie", **x} for x in data.get("results", [])]
     elif content_type in ("series", "miniseries"):
         data = await tmdb_get("/discover/tv", common)
-        items = []
-        for x in data.get("results", []):
-            # TMDB marks limited series with type=Miniseries on detail records.
-            # We filter below after fetching details.
-            items.append({"type":"series", **x})
+        items = [{"type": "series", **x} for x in data.get("results", [])]
     else:
-        m = await tmdb_get("/discover/movie", common)
-        t = await tmdb_get("/discover/tv", common)
-        items = [{"type":"movie", **x} for x in m.get("results", [])]
-        items += [{"type":"series", **x} for x in t.get("results", [])]
+        movie_data = await tmdb_get("/discover/movie", common)
+        tv_data = await tmdb_get("/discover/tv", common)
+        items = [{"type": "movie", **x} for x in movie_data.get("results", [])]
+        items += [{"type": "series", **x} for x in tv_data.get("results", [])]
 
-    # Normalize titles and optionally detect miniseries.
     out = []
     for item in items:
         media_type = item["type"]
@@ -97,21 +97,25 @@ async def search(
             "popularity": item.get("popularity"),
             "overview": item.get("overview"),
             "poster_path": item.get("poster_path"),
-            "tmdb_url": f"https://www.themoviedb.org/{'movie' if media_type=='movie' else 'tv'}/{item.get('id')}",
+            "netflix_views": None,
+            "hours_viewed": None,
+            "netflix_rank": None,
+            "tmdb_url": f"https://www.themoviedb.org/{'movie' if media_type == 'movie' else 'tv'}/{item.get('id')}",
         })
 
     if content_type == "miniseries":
         filtered = []
-        for x in out[:limit]:
-            details = await tmdb_get(f"/tv/{x['id']}", {"language":"en-US"})
-            if str(details.get("type","")).lower() == "miniseries":
-                x["type"] = "miniseries"
-                filtered.append(x)
+        for item in out:
+            details = await tmdb_get(f"/tv/{item['id']}", {"language": "en-US"})
+            if str(details.get("type", "")).lower() == "miniseries":
+                item["type"] = "miniseries"
+                filtered.append(item)
         out = filtered
-    else:
-        out = out[:limit]
 
-    return {
+    sort_key = {"rating": "rating", "votes": "vote_count", "popularity": "popularity"}[sort]
+    out.sort(key=lambda item: item.get(sort_key) or 0, reverse=True)
+
+    return JSONResponse(content={
         "region": region.upper(),
         "provider": "Netflix",
         "criteria": {
@@ -121,6 +125,41 @@ async def search(
             "min_votes": min_votes,
             "sort": sort,
         },
-        "results": out,
-        "note": "Netflix availability is sourced through TMDB's watch-provider data, powered by JustWatch."
+        "results": out[:limit],
+        "data_notes": [
+            "Netflix availability is sourced through TMDB watch-provider data, powered by JustWatch.",
+            "Netflix viewing metrics are reserved for a later official Netflix Top 10 integration.",
+        ],
+    })
+
+@app.get("/title/{media_type}/{tmdb_id}")
+async def get_title(media_type: Literal["movie", "tv"], tmdb_id: int):
+    details = await tmdb_get(
+        f"/{media_type}/{tmdb_id}",
+        {"language": "en-US", "append_to_response": "watch/providers"},
+    )
+    title = details.get("title") or details.get("name")
+    date = details.get("release_date") or details.get("first_air_date")
+    countries = [c.get("iso_3166_1") for c in details.get("production_countries", []) if c.get("iso_3166_1")]
+    region = DEFAULT_REGION.upper()
+    providers = details.get("watch/providers", {}).get("results", {}).get(region, {})
+    netflix = [p for p in providers.get("flatrate", []) if p.get("provider_id") == NETFLIX_PROVIDER_ID]
+    return {
+        "id": details.get("id"),
+        "type": "movie" if media_type == "movie" else ("miniseries" if str(details.get("type", "")).lower() == "miniseries" else "series"),
+        "title": title,
+        "original_title": details.get("original_title") or details.get("original_name"),
+        "year": (date or "")[:4] or None,
+        "production_countries": countries,
+        "rating": details.get("vote_average"),
+        "vote_count": details.get("vote_count"),
+        "popularity": details.get("popularity"),
+        "runtime_minutes": details.get("runtime") or (details.get("episode_run_time") or [None])[0],
+        "overview": details.get("overview"),
+        "poster_url": f"https://image.tmdb.org/t/p/w500{details['poster_path']}" if details.get("poster_path") else None,
+        "netflix_available_in_default_region": bool(netflix),
+        "netflix_views": None,
+        "hours_viewed": None,
+        "netflix_rank": None,
+        "tmdb_url": f"https://www.themoviedb.org/{media_type}/{tmdb_id}",
     }
