@@ -1,7 +1,7 @@
 const $=id=>document.getElementById(id);
 const API=window.location.origin;
 const poster=p=>p?`https://image.tmdb.org/t/p/w500${p}`:'';
-const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+const esc=s=>String(s??'').replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#039;'}[m]));
 const fmt=n=>new Intl.NumberFormat('pl-PL').format(n||0);
 
 const countryNames={
@@ -13,7 +13,7 @@ const countryNames={
   TR:'🇹🇷 Turcja',IS:'🇮🇸 Islandia',RO:'🇷🇴 Rumunia',UA:'🇺🇦 Ukraina',HR:'🇭🇷 Chorwacja',
   MX:'🇲🇽 Meksyk',BR:'🇧🇷 Brazylia',AR:'🇦🇷 Argentyna',CO:'🇨🇴 Kolumbia',CL:'🇨🇱 Chile',
   UY:'🇺🇾 Urugwaj',TH:'🇹🇭 Tajlandia',ID:'🇮🇩 Indonezja',TW:'🇹🇼 Tajwan',PH:'🇵🇭 Filipiny',
-  HK:'🇭🇰 Hongkong',NZ:'🇳🇿 Nowa Zelandia',ZA:'🇿🇦 RPA',NG:'🇳🇬 Nigeria'
+  HK:'🇭🇰 Hongkong',NZ:'🇳🇿 Nowa Zelandia',ZA:'🇿🇦 RPA',NG:'🇳🇬 Nigeria',IL:'🇮🇱 Izrael'
 };
 
 function params(){
@@ -85,6 +85,12 @@ async function openDetails(type,id){
     const netflix=x.netflix_available_in_default_region;
     const runtime=x.runtime_minutes?`${x.runtime_minutes} min`:null;
 
+    const metricsAvailable=x.netflix_rank!=null || x.netflix_views || x.hours_viewed;
+    const metricsWeek=x.netflix_metrics_week?`Tydzień od ${x.netflix_metrics_week}`:'';
+    const metricsNote=metricsAvailable
+      ? `Dane z Netflix Top 10${metricsWeek?` · ${metricsWeek}`:''}.`
+      : 'Ten tytuł nie pojawił się w znalezionych danych Netflix Top 10 dla ostatniego pełnego tygodnia.';
+
     content.innerHTML=`
       <div class="detail">
         <div class="detail-poster">
@@ -109,11 +115,11 @@ async function openDetails(type,id){
           <div class="netflix-metrics">
             <div class="metrics-title">NETFLIX TOP 10</div>
             <div class="metrics-grid">
-              <div><strong>${x.netflix_rank??'—'}</strong><small>Pozycja</small></div>
+              <div><strong>${x.netflix_rank??'—'}</strong><small>Pozycja DK</small></div>
               <div><strong>${x.netflix_views??'—'}</strong><small>Views</small></div>
               <div><strong>${x.hours_viewed??'—'}</strong><small>Hours Viewed</small></div>
             </div>
-            <div class="metrics-note">Dane Netflix zostaną podłączone w kolejnej wersji.</div>
+            <div class="metrics-note">${esc(metricsNote)}</div>
           </div>
 
           <a class="tmdb-link" target="_blank" rel="noopener" href="${x.tmdb_url}">Otwórz w TMDB ↗</a>
