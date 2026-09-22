@@ -1,424 +1,521 @@
 import os
 import re
-import asyncio
 import time
-import html as html_lib
-from typing import Literal, Optional
+from typing import Optional
 
-import httpx
+import requests
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse, FileResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 
-TMDB_TOKEN = os.getenv("TMDB_TOKEN")
-TMDB_BASE = "https://api.themoviedb.org/3"
-NETFLIX_PROVIDER_ID = 8
+app = FastAPI(title="Netflix Finder by Slawek", version="1.7.1")
+
+TMDB_TOKEN = os.getenv("TMDB_TOKEN", "")
 DEFAULT_REGION = os.getenv("DEFAULT_REGION", "DK")
+TOP10_CACHE_TTL = 3600
 
-app = FastAPI(
-    title="Netflix Finder",
-    version="1.7.0",
-    description="Find Netflix titles by filters or direct title search, with Netflix Top 10 metrics.",
-)
+_top10_cache = {}
 
-class UTF8JSONMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        response = await call_next(request)
-        if response.headers.get("content-type", "").startswith("application/json"):
-            response.headers["content-type"] = "application/json; charset=utf-8"
-        return response
 
-app.add_middleware(UTF8JSONMiddleware)
-
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-@app.get("/", include_in_schema=False)
-async def frontend():
-    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
-
-def provider_ids(value):
-    return None if value is None else str(value)
-
-async def tmdb_get(path: str, params: dict):
+def tmdb_headers():
     if not TMDB_TOKEN:
-        raise HTTPException(500, "TMDB_TOKEN is not configured.")
-    headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "Accept": "application/json"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.get(f"{TMDB_BASE}{path}", params=params, headers=headers)
-        if response.is_error:
-            raise HTTPException(response.status_code, f"TMDB request failed: HTTP {response.status_code}")
-        return response.json()
+        raise HTTPException(status_code=500, detail="TMDB_TOKEN is not configured")
+    return {
+        "Authorization": f"Bearer {TMDB_TOKEN}",
+        "Content-Type": "application/json",
+    }
 
-def normalize_title(value):
-    value = str(value or "").lower()
-    value = re.sub(r"\s*:\s*(season|part)\s+\d+.*$", "", value)
-    value = re.sub(r"\s+(season|part)\s+\d+.*$", "", value)
-    value = re.sub(r"[^a-z0-9]+", " ", value)
-    return re.sub(r"\s+", " ", value).strip()
 
-NETFLIX_PAGES = {
-    "movie_global": "https://www.netflix.com/tudum/top10/most-pop",
-    "tv_global": "https://www.netflix.com/tudum/top10/tv",
-    "movie_dk": "https://www.netflix.com/tudum/top10/denmark",
-    "tv_dk": "https://www.netflix.com/tudum/top10/denmark/tv/2021-08-15",
-}
-
-NETFLIX_PAGE_CACHE = {}
-NETFLIX_PAGE_CACHE_TTL = 3600
-
-def netflix_week_label(html):
-    m = re.search(
-        r"(?:Global|Denmark)\s*\|\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*-\s*(\d{1,2}/\d{1,2}/\d{2,4})",
-        html,
+def tmdb_get(path: str, params=None):
+    r = requests.get(
+        f"https://api.themoviedb.org/3{path}",
+        headers=tmdb_headers(),
+        params=params or {},
+        timeout=20,
     )
-    return f"{m.group(1)} - {m.group(2)}" if m else None
+    r.raise_for_status()
+    return r.json()
 
-def netflix_extract_rows(html, include_metrics=True):
-    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.I | re.S)
-    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = html_lib.unescape(text)
-    text = re.sub(r"\s+", " ", text).strip()
 
-    overview_match = re.search(
-        r"Top 10 (?:Movies|Shows) Overview\s+(.*?)(?:Explore The Most Watched|Understand the Methodology)",
-        text,
-        flags=re.I,
-    )
-    section = overview_match.group(1) if overview_match else text
+def normalize_title(value: str) -> str:
+    value = re.sub(r"\s+", " ", (value or "").strip().lower())
+    value = re.sub(r"[:\-–—'’.,!?()]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
 
-    rows = []
-    pattern = re.compile(
-        r"(?:^|\s)(0?[1-9]|10)\s+(.+?)\s+(?:\1\s+)?"
-        r"(\d{1,3}(?:,\d{3})+|\d+)"
-        r"(?:\s+(\d+:\d{2})\s+(\d{1,3}(?:,\d{3})+))?",
-        re.I,
-    )
 
-    for m in pattern.finditer(section):
-        rank = int(m.group(1))
-        title = m.group(2).strip()
-        if title.lower() in {"image", "button"}:
+def netflix_top10_url(region: str, media_type: str) -> str:
+    region = (region or DEFAULT_REGION).upper()
+
+    if region == "DK":
+        if media_type == "tv":
+            return "https://www.netflix.com/tudum/top10/denmark/tv/2021-08-15"
+        return "https://www.netflix.com/tudum/top10/denmark"
+
+    if media_type == "tv":
+        return "https://www.netflix.com/tudum/top10/tv"
+    return "https://www.netflix.com/tudum/top10/most-pop"
+
+
+def parse_number(value: str) -> Optional[float]:
+    if not value:
+        return None
+    s = value.strip().upper().replace(",", "")
+    m = re.search(r"([\d.]+)\s*([KMB])?", s)
+    if not m:
+        return None
+    n = float(m.group(1))
+    suffix = m.group(2)
+    if suffix == "K":
+        n *= 1_000
+    elif suffix == "M":
+        n *= 1_000_000
+    elif suffix == "B":
+        n *= 1_000_000_000
+    return n
+
+
+def parse_top10_html(html: str, region: str, media_type: str):
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+
+    # Netflix currently exposes the selected week in the page text.
+    week = None
+    m = re.search(r"(\d{1,2}/\d{1,2}/\d{2})\s*-\s*(\d{1,2}/\d{1,2}/\d{2})", text)
+    if m:
+        week = f"{m.group(1)} - {m.group(2)}"
+
+    results = []
+
+    # Global pages contain a structured Overview table. DK pages currently
+    # expose a simpler ranking table. Parse table rows when available.
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+        if len(cells) < 2:
             continue
+
+        row = " | ".join(cells)
+        if not re.search(r"\b(?:0?[1-9]|10)\b", row):
+            continue
+
+        # Extract a title from the first non-numeric cell.
+        title = None
+        for cell in cells:
+            cleaned = re.sub(r"^\d+\s*", "", cell).strip()
+            if cleaned and not re.fullmatch(r"[\d.,:+\-–—]+", cleaned):
+                if not re.fullmatch(r"(Ranking|Views|Runtime|Hours Viewed)", cleaned, re.I):
+                    title = cleaned
+                    break
+
+        if not title:
+            continue
+
+        rank = None
+        for cell in cells[:2]:
+            m_rank = re.search(r"\b(10|[1-9])\b", cell)
+            if m_rank:
+                rank = int(m_rank.group(1))
+                break
 
         views = None
-        runtime = None
         hours = None
+        runtime = None
 
-        tail = section[m.start():m.end() + 100]
-        nums = re.findall(r"\b\d{1,3}(?:,\d{3})+\b", tail)
-        runtimes = re.findall(r"\b\d+:\d{2}\b", tail)
+        for cell in cells:
+            if re.search(r"\d[\d,.]*\s*(?:K|M|B)?\s*views?", cell, re.I):
+                views = parse_number(cell)
+            if re.search(r"\d[\d,.]*\s*(?:K|M|B)?\s*(?:hours?)", cell, re.I):
+                hours = parse_number(cell)
+            if re.fullmatch(r"\d{1,2}:\d{2}", cell):
+                runtime = cell
 
-        if include_metrics and len(nums) >= 2:
-            views = nums[-2]
-            hours = nums[-1]
-        elif include_metrics and len(nums) == 1:
-            views = nums[-1]
+        if rank is not None and 1 <= rank <= 10:
+            results.append({
+                "title": title,
+                "rank": rank,
+                "views": views,
+                "hours_viewed": hours,
+                "runtime": runtime,
+            })
 
-        if runtimes:
-            runtime = runtimes[0]
+    # Fallback: parse the visible "#N in Movies/Shows" blocks.
+    if not results:
+        pattern = re.compile(
+            r"(?:Image#|Image\s*)\s*(10|[1-9])\s+in\s+(?:Movies|Shows)",
+            re.I
+        )
+        matches = list(pattern.finditer(text))
+        for match in matches:
+            rank = int(match.group(1))
+            before = text[max(0, match.start() - 400):match.start()]
+            lines = [x.strip() for x in before.splitlines() if x.strip()]
+            title = lines[-1] if lines else None
+            if title:
+                results.append({
+                    "title": title,
+                    "rank": rank,
+                    "views": None,
+                    "hours_viewed": None,
+                    "runtime": None,
+                })
 
-        rows.append({
-            "rank": rank,
-            "title": title,
-            "views": views,
-            "runtime": runtime,
-            "hours_viewed": hours,
-        })
+    # Deduplicate and sort.
+    unique = {}
+    for item in results:
+        key = (item["rank"], normalize_title(item["title"]))
+        unique[key] = item
 
-    return rows
-
-async def fetch_netflix_page(key):
-    cached = NETFLIX_PAGE_CACHE.get(key)
-    if cached and time.time() - cached[0] < NETFLIX_PAGE_CACHE_TTL:
-        return cached[1]
-
-    headers = {
-        "Accept": "text/html,application/xhtml+xml",
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
-            response = await client.get(NETFLIX_PAGES[key], headers=headers)
-            if response.is_error:
-                return None
-            html = response.text
-    except Exception:
-        return None
-
-    result = {
-        "week": netflix_week_label(html),
-        "rows": netflix_extract_rows(
-            html,
-            include_metrics=("global" in key),
-        ),
-    }
-    NETFLIX_PAGE_CACHE[key] = (time.time(), result)
-    return result
-
-async def netflix_top10(region: str, content_type: str, title: str, original_title: str = ""):
-    targets = {normalize_title(x) for x in (title, original_title) if x}
-    if not targets:
-        return None
-
-    is_movie = content_type == "movie"
-    global_key = "movie_global" if is_movie else "tv_global"
-    dk_key = "movie_dk" if is_movie else "tv_dk"
-
-    global_data, dk_data = await asyncio.gather(
-        fetch_netflix_page(global_key),
-        fetch_netflix_page(dk_key) if region.upper() == "DK" else asyncio.sleep(0, result=None),
-    )
-
-    def find_match(data):
-        if not data:
-            return None
-        for row in data["rows"]:
-            name = normalize_title(row.get("title"))
-            if name in targets or any(
-                name.startswith(t) or t.startswith(name) for t in targets
-            ):
-                return row
-        return None
-
-    match_global = find_match(global_data)
-    match_dk = find_match(dk_data)
-
-    if not match_global and not match_dk:
-        return None
+    results = sorted(unique.values(), key=lambda x: x["rank"])
 
     return {
-        "rank": match_dk.get("rank") if match_dk else None,
-        "global_rank": match_global.get("rank") if match_global else None,
-        "views": match_global.get("views") if match_global else None,
-        "hours_viewed": match_global.get("hours_viewed") if match_global else None,
-        "week": global_data.get("week") if global_data else (
-            dk_data.get("week") if dk_data else None
-        ),
-        "source": "Netflix Tudum Top 10",
+        "region": region.upper(),
+        "type": media_type,
+        "week": week,
+        "results": results[:10],
+        "source": netflix_top10_url(region, media_type),
     }
 
+
+def get_top10(region: str, media_type: str):
+    key = f"{region.upper()}:{media_type}"
+    now = time.time()
+    cached = _top10_cache.get(key)
+
+    if cached and now - cached["timestamp"] < TOP10_CACHE_TTL:
+        return cached["data"]
+
+    url = netflix_top10_url(region, media_type)
+    r = requests.get(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/140 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        timeout=25,
+    )
+    r.raise_for_status()
+
+    data = parse_top10_html(r.text, region, media_type)
+
+    _top10_cache[key] = {
+        "timestamp": now,
+        "data": data,
+    }
+    return data
+
+
+def match_top10(title: str, top10_data: dict):
+    wanted = normalize_title(title)
+    if not wanted:
+        return None
+
+    exact = []
+    partial = []
+
+    for item in top10_data.get("results", []):
+        candidate = normalize_title(item["title"])
+        if candidate == wanted:
+            exact.append(item)
+        elif wanted in candidate or candidate in wanted:
+            partial.append(item)
+
+    if exact:
+        return exact[0]
+    if partial:
+        return partial[0]
+    return None
+
+
+def enrich_with_top10(item: dict, region: str):
+    media_type = item.get("type", "movie")
+    top10_type = "tv" if media_type in ("tv", "series", "miniseries") else "movie"
+
+    try:
+        data = get_top10(region, top10_type)
+        hit = match_top10(item.get("title") or item.get("name") or "", data)
+
+        item["netflix_rank"] = hit["rank"] if hit else None
+        item["netflix_views"] = hit["views"] if hit else None
+        item["hours_viewed"] = hit["hours_viewed"] if hit else None
+        item["netflix_runtime"] = hit["runtime"] if hit else None
+        item["netflix_metrics_week"] = data.get("week")
+        item["netflix_metrics_source"] = data.get("source")
+    except Exception:
+        item["netflix_rank"] = None
+        item["netflix_views"] = None
+        item["hours_viewed"] = None
+        item["netflix_runtime"] = None
+        item["netflix_metrics_week"] = None
+        item["netflix_metrics_source"] = None
+
+    return item
+
+
+def production_countries(names):
+    return [{"name": x.get("name")} for x in (names or []) if x.get("name")]
+
+
 @app.get("/health")
-async def health():
+def health():
     return {"ok": True, "tmdb_configured": bool(TMDB_TOKEN)}
 
-@app.get("/lookup")
-async def lookup_title(
-    title: str = Query(..., min_length=1),
-    region: str = Query(DEFAULT_REGION, min_length=2, max_length=2),
-):
-    data = await tmdb_get(
-        "/search/multi",
-        {
-            "query": title,
-            "language": "en-US",
-            "include_adult": "false",
-            "page": 1,
-        },
-    )
 
-    matches = []
-    for item in data.get("results", [])[:10]:
-        media_type = item.get("media_type")
-        if media_type not in ("movie", "tv"):
+@app.get("/search")
+def search(
+    query: str = Query(..., min_length=1),
+    region: str = DEFAULT_REGION,
+    media_type: str = "all",
+    min_rating: float = 0,
+    min_votes: int = 0,
+    country: str = "",
+    sort_by: str = "rating",
+    limit: int = 20,
+):
+    region = region.upper()
+    media_type = media_type.lower()
+
+    params = {
+        "query": query,
+        "include_adult": "false",
+        "language": "en-US",
+        "page": 1,
+    }
+
+    data = tmdb_get("/search/multi", params)
+    results = []
+
+    for x in data.get("results", []):
+        tmdb_type = x.get("media_type")
+        if tmdb_type not in ("movie", "tv"):
             continue
 
-        name = item.get("title") or item.get("name")
-        original = item.get("original_title") or item.get("original_name") or ""
-        date_value = item.get("release_date") or item.get("first_air_date") or ""
+        if media_type == "movie" and tmdb_type != "movie":
+            continue
+        if media_type in ("series", "tv") and tmdb_type != "tv":
+            continue
 
-        metrics = await netflix_top10(
-            region.upper(),
-            "movie" if media_type == "movie" else "series",
-            name,
-            original,
-        )
+        rating = float(x.get("vote_average") or 0)
+        votes = int(x.get("vote_count") or 0)
 
-        matches.append({
-            "id": item.get("id"),
-            "type": "movie" if media_type == "movie" else "series",
-            "title": name,
-            "original_title": original,
-            "year": date_value[:4] or None,
-            "rating": item.get("vote_average"),
-            "vote_count": item.get("vote_count"),
-            "popularity": item.get("popularity"),
-            "overview": item.get("overview"),
-            "poster_path": item.get("poster_path"),
-            "netflix_rank": metrics.get("rank") if metrics else None,
-            "netflix_global_rank": metrics.get("global_rank") if metrics else None,
-            "netflix_views": metrics.get("views") if metrics else None,
-            "hours_viewed": metrics.get("hours_viewed") if metrics else None,
-            "netflix_metrics_week": metrics.get("week") if metrics else None,
+        if rating < min_rating or votes < min_votes:
+            continue
+
+        title = x.get("title") if tmdb_type == "movie" else x.get("name")
+        date = x.get("release_date") if tmdb_type == "movie" else x.get("first_air_date")
+        year = date[:4] if date else None
+
+        results.append({
+            "id": x["id"],
+            "type": tmdb_type,
+            "title": title,
+            "original_title": x.get("original_title") or x.get("original_name"),
+            "year": year,
+            "rating": rating,
+            "vote_count": votes,
+            "popularity": float(x.get("popularity") or 0),
+            "overview": x.get("overview") or "",
+            "poster_path": x.get("poster_path"),
         })
 
-    q = normalize_title(title)
-    matches.sort(
-        key=lambda x: (
-            0 if normalize_title(x.get("title")) == q else
-            1 if normalize_title(x.get("original_title")) == q else 2,
-            -(x.get("popularity") or 0),
+    # Country / Netflix availability is resolved against TMDB watch providers.
+    filtered = []
+    for item in results:
+        try:
+            providers = tmdb_get(
+                f"/{item['type']}/{item['id']}/watch/providers"
+            ).get("results", {})
+            region_data = providers.get(region, {})
+            flatrate = region_data.get("flatrate") or []
+
+            netflix = any(
+                p.get("provider_name", "").lower() == "netflix"
+                for p in flatrate
+            )
+
+            if netflix:
+                item["netflix_available"] = True
+            else:
+                item["netflix_available"] = False
+
+            if netflix:
+                filtered.append(item)
+        except Exception:
+            continue
+
+    if country:
+        # Country filtering is done from TMDB details.
+        wanted = country.upper()
+        country_filtered = []
+        for item in filtered:
+            try:
+                details = tmdb_get(f"/{item['type']}/{item['id']}")
+                codes = {
+                    c.get("iso_3166_1", "").upper()
+                    for c in details.get("production_countries", [])
+                }
+                if wanted in codes:
+                    country_filtered.append(item)
+            except Exception:
+                pass
+        filtered = country_filtered
+
+    if sort_by == "votes":
+        filtered.sort(key=lambda x: x["vote_count"], reverse=True)
+    elif sort_by == "popularity":
+        filtered.sort(key=lambda x: x["popularity"], reverse=True)
+    else:
+        filtered.sort(key=lambda x: (x["rating"], x["vote_count"]), reverse=True)
+
+    return {
+        "query": query,
+        "region": region,
+        "results": filtered[:max(1, min(limit, 50))],
+    }
+
+
+@app.get("/lookup")
+def lookup(
+    title: str = Query(..., min_length=1),
+    region: str = DEFAULT_REGION,
+):
+    region = region.upper()
+    found = []
+
+    for media_type in ("movie", "tv"):
+        data = tmdb_get(
+            f"/search/{media_type}",
+            {
+                "query": title,
+                "include_adult": "false",
+                "language": "en-US",
+                "page": 1,
+            },
         )
+
+        for x in data.get("results", [])[:5]:
+            item = {
+                "id": x["id"],
+                "type": media_type,
+                "title": x.get("title") if media_type == "movie" else x.get("name"),
+                "original_title": (
+                    x.get("original_title")
+                    if media_type == "movie"
+                    else x.get("original_name")
+                ),
+                "year": (
+                    (x.get("release_date") or "")[:4]
+                    if media_type == "movie"
+                    else (x.get("first_air_date") or "")[:4]
+                ),
+                "rating": float(x.get("vote_average") or 0),
+                "vote_count": int(x.get("vote_count") or 0),
+                "popularity": float(x.get("popularity") or 0),
+                "overview": x.get("overview") or "",
+            }
+
+            try:
+                providers = tmdb_get(
+                    f"/{media_type}/{x['id']}/watch/providers"
+                ).get("results", {})
+                region_data = providers.get(region, {})
+                flatrate = region_data.get("flatrate") or []
+                item["netflix_available"] = any(
+                    p.get("provider_name", "").lower() == "netflix"
+                    for p in flatrate
+                )
+            except Exception:
+                item["netflix_available"] = False
+
+            item = enrich_with_top10(item, region)
+            found.append(item)
+
+    found.sort(
+        key=lambda x: (
+            x["netflix_available"],
+            x["netflix_rank"] is not None,
+            -(x["netflix_rank"] or 999),
+            x["rating"],
+        ),
+        reverse=True,
     )
 
     return {
         "query": title,
-        "region": region.upper(),
-        "results": matches,
+        "region": region,
+        "results": found,
     }
 
-@app.get("/search")
-async def search(
-    production_country: Optional[str] = Query(None),
-    content_type: Literal["movie", "series", "miniseries", "all"] = "all",
-    min_rating: float = Query(0, ge=0, le=10),
-    min_votes: int = Query(0, ge=0),
-    sort: Literal["rating", "votes", "popularity"] = "rating",
-    region: str = Query(DEFAULT_REGION, min_length=2, max_length=2),
-    page: int = Query(1, ge=1, le=20),
-    limit: int = Query(10, ge=1, le=20),
-):
-    sort_map = {
-        "rating": "vote_average.desc",
-        "votes": "vote_count.desc",
-        "popularity": "popularity.desc",
-    }
-    common = {
-        "language": "en-US",
-        "watch_region": region.upper(),
-        "with_watch_providers": provider_ids(NETFLIX_PROVIDER_ID),
-        "with_watch_monetization_types": "flatrate",
-        "vote_average.gte": min_rating,
-        "vote_count.gte": min_votes,
-        "page": page,
-        "sort_by": sort_map[sort],
-        "include_adult": "false",
-    }
-
-    if production_country:
-        common["with_origin_country"] = production_country.upper()
-
-    if content_type == "movie":
-        data = await tmdb_get("/discover/movie", common)
-        items = [{"type": "movie", **x} for x in data.get("results", [])]
-    elif content_type in ("series", "miniseries"):
-        data = await tmdb_get("/discover/tv", common)
-        items = [{"type": "series", **x} for x in data.get("results", [])]
-    else:
-        movie_data, tv_data = await asyncio.gather(
-            tmdb_get("/discover/movie", common),
-            tmdb_get("/discover/tv", common),
-        )
-        items = [{"type": "movie", **x} for x in movie_data.get("results", [])]
-        items += [{"type": "series", **x} for x in tv_data.get("results", [])]
-
-    out = []
-    for item in items:
-        media_type = item["type"]
-        title = item.get("title") if media_type == "movie" else item.get("name")
-        date_value = item.get("release_date") if media_type == "movie" else item.get("first_air_date")
-
-        out.append({
-            "id": item.get("id"),
-            "type": media_type,
-            "title": title,
-            "original_title": item.get("original_title") or item.get("original_name"),
-            "year": (date_value or "")[:4] or None,
-            "rating": item.get("vote_average"),
-            "vote_count": item.get("vote_count"),
-            "popularity": item.get("popularity"),
-            "overview": item.get("overview"),
-            "poster_path": item.get("poster_path"),
-            "tmdb_url": f"https://www.themoviedb.org/{'movie' if media_type == 'movie' else 'tv'}/{item.get('id')}",
-        })
-
-    if content_type == "miniseries":
-        filtered = []
-        for item in out:
-            details = await tmdb_get(f"/tv/{item['id']}", {"language": "en-US"})
-            if str(details.get("type", "")).lower() == "miniseries":
-                item["type"] = "miniseries"
-                filtered.append(item)
-        out = filtered
-
-    sort_key = {"rating": "rating", "votes": "vote_count", "popularity": "popularity"}[sort]
-    out.sort(key=lambda item: item.get(sort_key) or 0, reverse=True)
-
-    return JSONResponse(content={
-        "region": region.upper(),
-        "provider": "Netflix",
-        "criteria": {
-            "production_country": production_country.upper() if production_country else None,
-            "content_type": content_type,
-            "min_rating": min_rating,
-            "min_votes": min_votes,
-            "sort": sort,
-        },
-        "results": out[:limit],
-        "data_notes": [
-            "Netflix availability is sourced through TMDB watch-provider data, powered by JustWatch.",
-            "Netflix Top 10 metrics are read from Netflix's public Tudum pages.",
-        ],
-    })
 
 @app.get("/title/{media_type}/{tmdb_id}")
-async def get_title(media_type: Literal["movie", "tv"], tmdb_id: int):
-    details = await tmdb_get(
-        f"/{media_type}/{tmdb_id}",
-        {"language": "en-US", "append_to_response": "watch/providers"},
-    )
+def title_details(
+    media_type: str,
+    tmdb_id: int,
+    region: str = DEFAULT_REGION,
+):
+    if media_type not in ("movie", "tv"):
+        raise HTTPException(status_code=400, detail="media_type must be movie or tv")
 
-    title = details.get("title") or details.get("name")
-    date_value = details.get("release_date") or details.get("first_air_date")
+    details = tmdb_get(f"/{media_type}/{tmdb_id}")
 
-    countries = [
-        c.get("iso_3166_1")
-        for c in details.get("production_countries", [])
-        if c.get("iso_3166_1")
-    ]
+    providers = tmdb_get(
+        f"/{media_type}/{tmdb_id}/watch/providers"
+    ).get("results", {})
 
-    region = DEFAULT_REGION.upper()
-    providers = details.get("watch/providers", {}).get("results", {}).get(region, {})
-    netflix = [
-        p for p in providers.get("flatrate", [])
-        if p.get("provider_id") == NETFLIX_PROVIDER_ID
-    ]
+    region_data = providers.get(region.upper(), {})
+    flatrate = region_data.get("flatrate") or []
 
-    netflix_data = await netflix_top10(
-        region,
-        "movie" if media_type == "movie" else "series",
-        title,
-        details.get("original_title") or details.get("original_name") or "",
-    )
-
-    return {
-        "id": details.get("id"),
-        "type": "movie" if media_type == "movie" else (
-            "miniseries" if str(details.get("type", "")).lower() == "miniseries" else "series"
+    netflix_provider = next(
+        (
+            p for p in flatrate
+            if p.get("provider_name", "").lower() == "netflix"
         ),
+        None,
+    )
+
+    title = details.get("title") if media_type == "movie" else details.get("name")
+    original_title = (
+        details.get("original_title")
+        if media_type == "movie"
+        else details.get("original_name")
+    )
+
+    release_date = (
+        details.get("release_date")
+        if media_type == "movie"
+        else details.get("first_air_date")
+    )
+
+    runtime = details.get("runtime")
+    if media_type == "tv":
+        runtimes = details.get("episode_run_time") or []
+        runtime = runtimes[0] if runtimes else None
+
+    result = {
+        "id": tmdb_id,
+        "type": media_type,
         "title": title,
-        "original_title": details.get("original_title") or details.get("original_name"),
-        "year": (date_value or "")[:4] or None,
-        "production_countries": countries,
-        "rating": details.get("vote_average"),
-        "vote_count": details.get("vote_count"),
-        "popularity": details.get("popularity"),
-        "runtime_minutes": details.get("runtime") or (details.get("episode_run_time") or [None])[0],
-        "overview": details.get("overview"),
-        "poster_url": (
-            f"https://image.tmdb.org/t/p/w500{details['poster_path']}"
-            if details.get("poster_path") else None
+        "original_title": original_title,
+        "year": release_date[:4] if release_date else None,
+        "rating": float(details.get("vote_average") or 0),
+        "vote_count": int(details.get("vote_count") or 0),
+        "popularity": float(details.get("popularity") or 0),
+        "overview": details.get("overview") or "",
+        "poster_path": details.get("poster_path"),
+        "backdrop_path": details.get("backdrop_path"),
+        "runtime": runtime,
+        "genres": [g.get("name") for g in details.get("genres", [])],
+        "production_countries": production_countries(
+            details.get("production_countries")
         ),
-        "netflix_available_in_default_region": bool(netflix),
-        "netflix_views": netflix_data.get("views") if netflix_data else None,
-        "hours_viewed": netflix_data.get("hours_viewed") if netflix_data else None,
-        "netflix_rank": netflix_data.get("rank") if netflix_data else None,
-        "netflix_global_rank": netflix_data.get("global_rank") if netflix_data else None,
-        "netflix_metrics_week": netflix_data.get("week") if netflix_data else None,
-        "netflix_metrics_source": netflix_data.get("source") if netflix_data else None,
+        "netflix_available": bool(netflix_provider),
+        "netflix_provider": netflix_provider,
         "tmdb_url": f"https://www.themoviedb.org/{media_type}/{tmdb_id}",
     }
+
+    return enrich_with_top10(result, region)
+
+
+app.mount("/", StaticFiles(directory="app/static", html=True), name="static")
