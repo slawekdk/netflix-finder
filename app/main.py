@@ -190,6 +190,90 @@ async def netflix_top10(region: str, content_type: str, title: str, original_tit
     NETFLIX_CACHE[cache_key] = (time.time(), result)
     return result
 
+@app.get("/debug/netflix")
+async def debug_netflix(title: str = Query(..., min_length=1)):
+    """Temporary diagnostic endpoint for Netflix Top 10 connectivity/response shape."""
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.netflix.com/tudum/top10/",
+    }
+
+    weeks = netflix_week_dates()[:4]
+
+    output = {
+        "title_requested": title,
+        "normalized_title": normalize_title(title),
+        "weeks_tested": weeks,
+        "requests": [],
+    }
+
+    async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+        for week in weeks:
+            params = {
+                "category": "films",
+                "region": "DK",
+                "week": week,
+            }
+
+            item = {
+                "week": week,
+                "url": str(httpx.URL(NETFLIX_API, params=params)),
+            }
+
+            try:
+                r = await client.get(
+                    NETFLIX_API,
+                    params=params,
+                    headers=headers,
+                )
+
+                item["status_code"] = r.status_code
+                item["content_type"] = r.headers.get("content-type")
+                item["final_url"] = str(r.url)
+                item["body_prefix"] = r.text[:1500]
+
+                if r.is_success:
+                    try:
+                        data = r.json()
+                        rows = walk_rows(data)
+
+                        item["json_type"] = type(data).__name__
+                        item["rows_found"] = len(rows)
+
+                        item["matching_rows"] = [
+                            {
+                                "title": row_value(row, "title", "name"),
+                                "rank": row_value(
+                                    row, "rank", "ranking", "position"
+                                ),
+                                "views": row_value(
+                                    row, "views", "view_count", "viewcount"
+                                ),
+                                "hours_viewed": row_value(
+                                    row,
+                                    "hours_viewed",
+                                    "hoursviewed",
+                                    "hours_watched",
+                                    "hours",
+                                ),
+                            }
+                            for row in rows
+                            if normalize_title(
+                                row_value(row, "title", "name")
+                            ) == normalize_title(title)
+                        ][:10]
+
+                    except Exception as e:
+                        item["json_error"] = str(e)
+
+            except Exception as e:
+                item["error"] = repr(e)
+
+            output["requests"].append(item)
+
+    return output
+    
 @app.get("/health")
 async def health():
     return {"ok": True, "tmdb_configured": bool(TMDB_TOKEN)}
