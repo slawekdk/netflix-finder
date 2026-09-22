@@ -3,8 +3,9 @@ from typing import Literal, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.staticfiles import StaticFiles
 
 TMDB_TOKEN = os.getenv("TMDB_TOKEN")
 TMDB_BASE = "https://api.themoviedb.org/3"
@@ -13,7 +14,7 @@ DEFAULT_REGION = os.getenv("DEFAULT_REGION", "DK")
 
 app = FastAPI(
     title="Netflix Finder",
-    version="1.1.0",
+    version="1.2.0",
     description="Find Netflix titles by production country, type, rating, vote count and popularity."
 )
 
@@ -25,6 +26,14 @@ class UTF8JSONMiddleware(BaseHTTPMiddleware):
         return response
 
 app.add_middleware(UTF8JSONMiddleware)
+
+# Mobile-first web UI
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+@app.get("/", include_in_schema=False)
+async def frontend():
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 async def tmdb_get(path: str, params: dict):
     if not TMDB_TOKEN:
