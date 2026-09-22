@@ -3,8 +3,8 @@ import re
 import time
 from typing import Optional
 
-import requests
-from bs4 import BeautifulSoup
+import httpx
+from html.parser import HTMLParser
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 
@@ -27,11 +27,12 @@ def tmdb_headers():
 
 
 def tmdb_get(path: str, params=None):
-    r = requests.get(
+    r = httpx.get(
         f"https://api.themoviedb.org/3{path}",
         headers=tmdb_headers(),
         params=params or {},
         timeout=20,
+        follow_redirects=True,
     )
     r.raise_for_status()
     return r.json()
@@ -75,9 +76,50 @@ def parse_number(value: str) -> Optional[float]:
     return n
 
 
+class _Top10HTMLParser(HTMLParser):
+    """Small dependency-free parser for Netflix Tudum table rows."""
+
+    def __init__(self):
+        super().__init__()
+        self.in_tr = False
+        self.in_cell = False
+        self.current_cell = []
+        self.current_row = []
+        self.rows = []
+        self.text_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "tr":
+            self.in_tr = True
+            self.current_row = []
+        elif self.in_tr and tag in ("td", "th"):
+            self.in_cell = True
+            self.current_cell = []
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in ("td", "th") and self.in_cell:
+            value = re.sub(r"\\s+", " ", " ".join(self.current_cell)).strip()
+            self.current_row.append(value)
+            self.in_cell = False
+        elif tag == "tr" and self.in_tr:
+            if self.current_row:
+                self.rows.append(self.current_row)
+            self.in_tr = False
+        elif tag in ("p", "div", "li", "h1", "h2", "h3", "h4", "section", "br"):
+            self.text_parts.append("\n")
+
+    def handle_data(self, data):
+        if self.in_cell:
+            self.current_cell.append(data.strip())
+        self.text_parts.append(data.strip())
+
+
 def parse_top10_html(html: str, region: str, media_type: str):
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
+    parser = _Top10HTMLParser()
+    parser.feed(html)
+    text = re.sub(r"\\s+", " ", " ".join(parser.text_parts)).strip()
 
     # Netflix currently exposes the selected week in the page text.
     week = None
@@ -89,8 +131,7 @@ def parse_top10_html(html: str, region: str, media_type: str):
 
     # Global pages contain a structured Overview table. DK pages currently
     # expose a simpler ranking table. Parse table rows when available.
-    for tr in soup.find_all("tr"):
-        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+    for cells in parser.rows:
         if len(cells) < 2:
             continue
 
@@ -185,7 +226,7 @@ def get_top10(region: str, media_type: str):
         return cached["data"]
 
     url = netflix_top10_url(region, media_type)
-    r = requests.get(
+    r = httpx.get(
         url,
         headers={
             "User-Agent": (
@@ -195,6 +236,7 @@ def get_top10(region: str, media_type: str):
             "Accept-Language": "en-US,en;q=0.9",
         },
         timeout=25,
+        follow_redirects=True,
     )
     r.raise_for_status()
 
