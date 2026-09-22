@@ -3,7 +3,6 @@ import re
 import asyncio
 import time
 import html as html_lib
-from datetime import date, timedelta
 from typing import Literal, Optional
 
 import httpx
@@ -17,14 +16,10 @@ TMDB_BASE = "https://api.themoviedb.org/3"
 NETFLIX_PROVIDER_ID = 8
 DEFAULT_REGION = os.getenv("DEFAULT_REGION", "DK")
 
-NETFLIX_API = "https://www.netflix.com/tudum/top10/api/data"
-NETFLIX_CACHE = {}
-NETFLIX_CACHE_TTL = 3600
-
 app = FastAPI(
     title="Netflix Finder",
-    version="1.6.0",
-    description="Find Netflix titles by production country, type, rating, vote count, popularity and Netflix Top 10 metrics.",
+    version="1.7.0",
+    description="Find Netflix titles by filters or direct title search, with Netflix Top 10 metrics.",
 )
 
 class UTF8JSONMiddleware(BaseHTTPMiddleware):
@@ -63,9 +58,6 @@ def normalize_title(value):
     value = re.sub(r"[^a-z0-9]+", " ", value)
     return re.sub(r"\s+", " ", value).strip()
 
-
-# Netflix's old /api/data endpoint now returns the Tudum HTML page.
-# We therefore parse the public Tudum Top 10 pages instead.
 NETFLIX_PAGES = {
     "movie_global": "https://www.netflix.com/tudum/top10/most-pop",
     "tv_global": "https://www.netflix.com/tudum/top10/tv",
@@ -76,32 +68,20 @@ NETFLIX_PAGES = {
 NETFLIX_PAGE_CACHE = {}
 NETFLIX_PAGE_CACHE_TTL = 3600
 
-
 def netflix_week_label(html):
-    # e.g. "Global | 9/7/26 - 9/13/26" or "Denmark | 9/7/26 - 9/13/26"
-    m = re.search(r"(?:Global|Denmark)\s*\|\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*-\s*(\d{1,2}/\d{1,2}/\d{2,4})", html)
+    m = re.search(
+        r"(?:Global|Denmark)\s*\|\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*-\s*(\d{1,2}/\d{1,2}/\d{2,4})",
+        html,
+    )
     return f"{m.group(1)} - {m.group(2)}" if m else None
 
-
 def netflix_extract_rows(html, include_metrics=True):
-    """
-    Extract the Top 10 overview table from Tudum's server-rendered HTML.
-    We intentionally parse the text around the 'Top 10 ... Overview' table
-    rather than relying on Netflix's retired JSON endpoint.
-    """
     text = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.I | re.S)
     text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
     text = re.sub(r"<[^>]+>", " ", text)
     text = html_lib.unescape(text)
     text = re.sub(r"\s+", " ", text).strip()
 
-    # Normalize common separators that appear in rendered table text.
-    text = text.replace("Ranking Views Runtime Hours Viewed", "Ranking Views Runtime Hours Viewed")
-    rows = []
-
-    # The page contains the title, then its weekly views, then the rank.
-    # The overview table later repeats the title followed by numeric columns.
-    # We first locate the overview section and parse its 10 numbered entries.
     overview_match = re.search(
         r"Top 10 (?:Movies|Shows) Overview\s+(.*?)(?:Explore The Most Watched|Understand the Methodology)",
         text,
@@ -109,25 +89,20 @@ def netflix_extract_rows(html, include_metrics=True):
     )
     section = overview_match.group(1) if overview_match else text
 
-    # Titles in the overview are separated by the numeric rank. Because
-    # titles can contain punctuation and colons, capture up to the next
-    # 1-10 rank marker.
+    rows = []
     pattern = re.compile(
-        r"(?:^|\s)(0?[1-9]|10)\s+(.+?)\s+(?:\1\s+)?(\d{1,3}(?:,\d{3})+|\d+)(?:\s+(\d+:\d{2})\s+(\d{1,3}(?:,\d{3})+))?",
+        r"(?:^|\s)(0?[1-9]|10)\s+(.+?)\s+(?:\1\s+)?"
+        r"(\d{1,3}(?:,\d{3})+|\d+)"
+        r"(?:\s+(\d+:\d{2})\s+(\d{1,3}(?:,\d{3})+))?",
         re.I,
     )
 
     for m in pattern.finditer(section):
         rank = int(m.group(1))
         title = m.group(2).strip()
-        # Avoid accidentally capturing the column heading.
         if title.lower() in {"image", "button"}:
             continue
 
-        # For global pages the table has:
-        # rank | title | secondary rank | views | runtime | hours
-        # The regex above can be ambiguous, so also inspect the nearby
-        # substring and use the last numeric fields where available.
         views = None
         runtime = None
         hours = None
@@ -136,9 +111,12 @@ def netflix_extract_rows(html, include_metrics=True):
         nums = re.findall(r"\b\d{1,3}(?:,\d{3})+\b", tail)
         runtimes = re.findall(r"\b\d+:\d{2}\b", tail)
 
-        if include_metrics and len(nums) >= 1:
-            views = nums[-2] if len(nums) >= 2 else nums[-1]
-            hours = nums[-1] if len(nums) >= 2 else None
+        if include_metrics and len(nums) >= 2:
+            views = nums[-2]
+            hours = nums[-1]
+        elif include_metrics and len(nums) == 1:
+            views = nums[-1]
+
         if runtimes:
             runtime = runtimes[0]
 
@@ -150,38 +128,13 @@ def netflix_extract_rows(html, include_metrics=True):
             "hours_viewed": hours,
         })
 
-    # Fallback parser: use the visible cards if the table parser did not
-    # find rows. This still gives us a usable title/rank match.
-    if not rows:
-        card_match = re.search(
-            r"Top 10 (?:Movies|Shows).*?(?:Overview)",
-            text,
-            flags=re.I,
-        )
-        if card_match:
-            prefix = text[card_match.start():]
-            for m in re.finditer(
-                r"(?:#(10|[1-9]))\s+(.{2,100}?)(?=\s+\d+(?:\.\d+)?M views this week)",
-                prefix,
-                flags=re.I,
-            ):
-                rows.append({
-                    "rank": int(m.group(1)),
-                    "title": m.group(2).strip(),
-                    "views": None,
-                    "runtime": None,
-                    "hours_viewed": None,
-                })
-
     return rows
-
 
 async def fetch_netflix_page(key):
     cached = NETFLIX_PAGE_CACHE.get(key)
     if cached and time.time() - cached[0] < NETFLIX_PAGE_CACHE_TTL:
         return cached[1]
 
-    url = NETFLIX_PAGES[key]
     headers = {
         "Accept": "text/html,application/xhtml+xml",
         "User-Agent": "Mozilla/5.0",
@@ -190,7 +143,7 @@ async def fetch_netflix_page(key):
 
     try:
         async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
+            response = await client.get(NETFLIX_PAGES[key], headers=headers)
             if response.is_error:
                 return None
             html = response.text
@@ -198,14 +151,14 @@ async def fetch_netflix_page(key):
         return None
 
     result = {
-        "html": html,
         "week": netflix_week_label(html),
-        "rows": netflix_extract_rows(html, include_metrics=("global" in key)),
+        "rows": netflix_extract_rows(
+            html,
+            include_metrics=("global" in key),
+        ),
     }
-
     NETFLIX_PAGE_CACHE[key] = (time.time(), result)
     return result
-
 
 async def netflix_top10(region: str, content_type: str, title: str, original_title: str = ""):
     targets = {normalize_title(x) for x in (title, original_title) if x}
@@ -216,32 +169,24 @@ async def netflix_top10(region: str, content_type: str, title: str, original_tit
     global_key = "movie_global" if is_movie else "tv_global"
     dk_key = "movie_dk" if is_movie else "tv_dk"
 
-    # Fetch global metrics and DK ranking concurrently. Each page is cached
-    # for an hour, so opening several titles does not repeatedly hit Netflix.
     global_data, dk_data = await asyncio.gather(
         fetch_netflix_page(global_key),
         fetch_netflix_page(dk_key) if region.upper() == "DK" else asyncio.sleep(0, result=None),
     )
 
-    match_global = None
-    if global_data:
-        for row in global_data["rows"]:
+    def find_match(data):
+        if not data:
+            return None
+        for row in data["rows"]:
             name = normalize_title(row.get("title"))
             if name in targets or any(
                 name.startswith(t) or t.startswith(name) for t in targets
             ):
-                match_global = row
-                break
+                return row
+        return None
 
-    match_dk = None
-    if dk_data:
-        for row in dk_data["rows"]:
-            name = normalize_title(row.get("title"))
-            if name in targets or any(
-                name.startswith(t) or t.startswith(name) for t in targets
-            ):
-                match_dk = row
-                break
+    match_global = find_match(global_data)
+    match_dk = find_match(dk_data)
 
     if not match_global and not match_dk:
         return None
@@ -251,17 +196,80 @@ async def netflix_top10(region: str, content_type: str, title: str, original_tit
         "global_rank": match_global.get("rank") if match_global else None,
         "views": match_global.get("views") if match_global else None,
         "hours_viewed": match_global.get("hours_viewed") if match_global else None,
-        "week": (
-            global_data.get("week") if global_data
-            else (dk_data.get("week") if dk_data else None)
+        "week": global_data.get("week") if global_data else (
+            dk_data.get("week") if dk_data else None
         ),
         "source": "Netflix Tudum Top 10",
-        "rank_region": region.upper() if match_dk else None,
     }
 
 @app.get("/health")
 async def health():
     return {"ok": True, "tmdb_configured": bool(TMDB_TOKEN)}
+
+@app.get("/lookup")
+async def lookup_title(
+    title: str = Query(..., min_length=1),
+    region: str = Query(DEFAULT_REGION, min_length=2, max_length=2),
+):
+    data = await tmdb_get(
+        "/search/multi",
+        {
+            "query": title,
+            "language": "en-US",
+            "include_adult": "false",
+            "page": 1,
+        },
+    )
+
+    matches = []
+    for item in data.get("results", [])[:10]:
+        media_type = item.get("media_type")
+        if media_type not in ("movie", "tv"):
+            continue
+
+        name = item.get("title") or item.get("name")
+        original = item.get("original_title") or item.get("original_name") or ""
+        date_value = item.get("release_date") or item.get("first_air_date") or ""
+
+        metrics = await netflix_top10(
+            region.upper(),
+            "movie" if media_type == "movie" else "series",
+            name,
+            original,
+        )
+
+        matches.append({
+            "id": item.get("id"),
+            "type": "movie" if media_type == "movie" else "series",
+            "title": name,
+            "original_title": original,
+            "year": date_value[:4] or None,
+            "rating": item.get("vote_average"),
+            "vote_count": item.get("vote_count"),
+            "popularity": item.get("popularity"),
+            "overview": item.get("overview"),
+            "poster_path": item.get("poster_path"),
+            "netflix_rank": metrics.get("rank") if metrics else None,
+            "netflix_global_rank": metrics.get("global_rank") if metrics else None,
+            "netflix_views": metrics.get("views") if metrics else None,
+            "hours_viewed": metrics.get("hours_viewed") if metrics else None,
+            "netflix_metrics_week": metrics.get("week") if metrics else None,
+        })
+
+    q = normalize_title(title)
+    matches.sort(
+        key=lambda x: (
+            0 if normalize_title(x.get("title")) == q else
+            1 if normalize_title(x.get("original_title")) == q else 2,
+            -(x.get("popularity") or 0),
+        )
+    )
+
+    return {
+        "query": title,
+        "region": region.upper(),
+        "results": matches,
+    }
 
 @app.get("/search")
 async def search(
@@ -290,6 +298,7 @@ async def search(
         "sort_by": sort_map[sort],
         "include_adult": "false",
     }
+
     if production_country:
         common["with_origin_country"] = production_country.upper()
 
@@ -312,6 +321,7 @@ async def search(
         media_type = item["type"]
         title = item.get("title") if media_type == "movie" else item.get("name")
         date_value = item.get("release_date") if media_type == "movie" else item.get("first_air_date")
+
         out.append({
             "id": item.get("id"),
             "type": media_type,
@@ -351,7 +361,7 @@ async def search(
         "results": out[:limit],
         "data_notes": [
             "Netflix availability is sourced through TMDB watch-provider data, powered by JustWatch.",
-            "Netflix Top 10 metrics are read from Netflix's public Top 10 data endpoint when available.",
+            "Netflix Top 10 metrics are read from Netflix's public Tudum pages.",
         ],
     })
 
@@ -361,13 +371,16 @@ async def get_title(media_type: Literal["movie", "tv"], tmdb_id: int):
         f"/{media_type}/{tmdb_id}",
         {"language": "en-US", "append_to_response": "watch/providers"},
     )
+
     title = details.get("title") or details.get("name")
     date_value = details.get("release_date") or details.get("first_air_date")
+
     countries = [
         c.get("iso_3166_1")
         for c in details.get("production_countries", [])
         if c.get("iso_3166_1")
     ]
+
     region = DEFAULT_REGION.upper()
     providers = details.get("watch/providers", {}).get("results", {}).get(region, {})
     netflix = [
@@ -404,7 +417,7 @@ async def get_title(media_type: Literal["movie", "tv"], tmdb_id: int):
         "netflix_views": netflix_data.get("views") if netflix_data else None,
         "hours_viewed": netflix_data.get("hours_viewed") if netflix_data else None,
         "netflix_rank": netflix_data.get("rank") if netflix_data else None,
-        "netflix_weeks_in_top10": netflix_data.get("weeks_in_top10") if netflix_data else None,
+        "netflix_global_rank": netflix_data.get("global_rank") if netflix_data else None,
         "netflix_metrics_week": netflix_data.get("week") if netflix_data else None,
         "netflix_metrics_source": netflix_data.get("source") if netflix_data else None,
         "tmdb_url": f"https://www.themoviedb.org/{media_type}/{tmdb_id}",
