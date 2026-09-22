@@ -318,7 +318,12 @@ async def get_title(media_type: Literal["movie", "tv"], tmdb_id: int):
     providers = details.get("watch/providers", {}).get("results", {}).get(region, {})
     netflix = [p for p in providers.get("flatrate", []) if p.get("provider_id") == NETFLIX_PROVIDER_ID]
 
-    netflix_data = await netflix_top10(\n        region,\n        "movie" if media_type == "movie" else "series",\n        title,\n        details.get("original_title") or details.get("original_name") or "",\n    )
+    netflix_data = await netflix_top10(
+        region,
+        "movie" if media_type == "movie" else "series",
+        title,
+        details.get("original_title") or details.get("original_name") or "",
+    )
 
     return {
         "id": details.get("id"),
