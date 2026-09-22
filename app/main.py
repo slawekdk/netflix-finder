@@ -1,4 +1,7 @@
 import os
+import asyncio
+import html
+import time
 import re
 from datetime import date, timedelta
 from typing import Literal, Optional
@@ -13,7 +16,9 @@ TMDB_TOKEN = os.getenv("TMDB_TOKEN")
 TMDB_BASE = "https://api.themoviedb.org/3"
 NETFLIX_PROVIDER_ID = 8
 DEFAULT_REGION = os.getenv("DEFAULT_REGION", "DK")
-NETFLIX_TOP10_BASE = "https://www.netflix.com/tudum/top10/api/data"
+NETFLIX_TOP10_BASE = "https://www.netflix.com/tudum/top10"
+NETFLIX_CACHE = {}
+NETFLIX_CACHE_TTL = 3600
 
 app = FastAPI(
     title="Netflix Finder",
@@ -47,167 +52,112 @@ async def tmdb_get(path: str, params: dict):
             raise HTTPException(response.status_code, f"TMDB request failed: HTTP {response.status_code}")
         return response.json()
 
-def provider_ids(value):
-    return None if value is None else str(value)
-
+d
 def normalize_title(value):
     value = str(value or "").lower()
-    value = re.sub(r"\s*:\s*(season|part)\s+\d+.*$", "", value)
-    value = re.sub(r"\s+(season|part)\s+\d+.*$", "", value)
-    value = re.sub(r"[^a-z0-9ąćęłńóśźżäöüß]+", " ", value)
-    return re.sub(r"\s+", " ", value).strip()
+    value = re.sub(r"\\s*:\\s*(season|part)\\s+\\d+.*$", "", value)
+    value = re.sub(r"\\s+(season|part)\\s+\\d+.*$", "", value)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\\s+", " ", value).strip()
 
-def previous_week_date():
-    # Netflix Top 10 weekly data is keyed by the Friday ending the
-    # published Monday-Sunday reporting week (e.g. 2026-09-11 for 9/7-9/13).
+def previous_completed_week():
+    # Netflix weekly charts are Monday-Sunday; the week parameter is Sunday.
     today = date.today()
-    days_since_friday = (today.weekday() - 4) % 7
-    this_friday = today - timedelta(days=days_since_friday)
-    # If today is Friday, use the previous completed Friday.
-    if today.weekday() == 4:
-        this_friday -= timedelta(days=7)
-    return this_friday.isoformat()
+    sunday = today - timedelta(days=(today.weekday() + 1) % 7)
+    if sunday >= today:
+        sunday -= timedelta(days=7)
+    return sunday.isoformat()
 
-def candidate_week_dates():
-    first = date.fromisoformat(previous_week_date())
-    return [(first - timedelta(days=7*i)).isoformat() for i in range(6)]
+def clean_html(raw):
+    raw = re.sub(r"<script\\b[^>]*>.*?</script>", " ", raw, flags=re.I | re.S)
+    raw = re.sub(r"<style\\b[^>]*>.*?</style>", " ", raw, flags=re.I | re.S)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = html.unescape(raw)
+    return re.sub(r"\\s+", " ", raw).strip()
 
-def _walk_rows(obj):
-    """Find dicts that look like Netflix Top 10 rows in a nested response."""
-    rows = []
-    if isinstance(obj, dict):
-        keys = {str(k).lower() for k in obj.keys()}
-        if ("views" in keys or "hoursviewed" in keys or "hours_viewed" in keys) and (
-            "title" in keys or "name" in keys
-        ):
-            rows.append(obj)
-        for value in obj.values():
-            rows.extend(_walk_rows(value))
-    elif isinstance(obj, list):
-        for value in obj:
-            rows.extend(_walk_rows(value))
-    return rows
-
-def _first(row, *keys):
-    for key in keys:
-        if key in row and row[key] not in (None, ""):
-            return row[key]
-        for actual in row:
-            if str(actual).lower() == key.lower() and row[actual] not in (None, ""):
-                return row[actual]
+def title_context(text, titles):
+    if not text:
+        return None
+    for title in titles:
+        if title:
+            m = re.search(re.escape(title), text, flags=re.I)
+            if m:
+                return text[max(0, m.start()-300):m.start()+1800]
     return None
 
-def _metric_number(value):
-    if value is None:
+def parse_rank(context):
+    if not context:
         return None
-    if isinstance(value, (int, float)):
-        return value
-    s = str(value).replace(",", "").strip()
-    try:
-        return float(s)
-    except ValueError:
+    m = re.search(r"#\\s*(\\d{1,2})\\s+in\\s+(?:Movies|Shows)", context, re.I)
+    return int(m.group(1)) if m else None
+
+def parse_views(context):
+    if not context:
         return None
+    m = re.search(r"([\\d,.]+)\\s*([MK]?)\\s+views\\s+this\\s+week", context, re.I)
+    return f"{m.group(1)}{m.group(2).upper()}" if m else None
 
-def _format_views(value):
-    n = _metric_number(value)
-    if n is None:
+def parse_hours(context):
+    if not context:
         return None
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n/1_000:.0f}K"
-    return f"{int(n):,}"
+    m = re.search(r"([\\d,.]+[MK]?)\\s+Hours\\s+Viewed", context, re.I)
+    return m.group(1) if m else None
 
-async def netflix_top10(region: str, content_type: str, title: str, original_title: str = ""):
-    """
-    Read Netflix's public Top 10 data endpoint on a best-effort basis.
-    Netflix has changed the public endpoint/schema over time, so try the
-    most recent completed weekly keys and a few known category variants.
-    """
-    categories = ["films", "tv"] if content_type != "movie" else ["films"]
-    titles = [title, original_title]
-    target_titles = {normalize_title(x) for x in titles if x}
-
-    def extract_rows(obj):
-        rows = []
-        if isinstance(obj, dict):
-            keys = {str(k).lower().replace("-", "").replace("_", "") for k in obj.keys()}
-            has_title = any(k in keys for k in ("title", "name"))
-            has_metric = any(k in keys for k in (
-                "views", "viewcount", "hoursviewed", "hours", "hourswatched"
-            ))
-            if has_title and has_metric:
-                rows.append(obj)
-            for value in obj.values():
-                rows.extend(extract_rows(value))
-        elif isinstance(obj, list):
-            for value in obj:
-                rows.extend(extract_rows(value))
-        return rows
-
-    def get_value(row, *wanted):
-        wanted_norm = {w.lower().replace("-", "").replace("_", "") for w in wanted}
-        for k, v in row.items():
-            if str(k).lower().replace("-", "").replace("_", "") in wanted_norm and v not in (None, ""):
-                return v
+async def netflix_top10(region, content_type, title, original_title=""):
+    # Netflix country charts provide the DK rank. Global charts provide
+    # weekly Views and Hours Viewed. Fetch both pages concurrently.
+    if region.upper() != "DK":
         return None
 
-    for week in candidate_week_dates():
-        for category in categories:
-            params = {
-                "category": category,
-                "region": region.upper(),
-                "week": week,
-            }
-            headers = {
-                "Accept": "application/json, text/plain, */*",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
-                "Referer": "https://www.netflix.com/tudum/top10/",
-            }
-            try:
-                async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-                    r = await client.get(NETFLIX_TOP10_BASE, params=params, headers=headers)
-                    if r.status_code >= 400:
-                        continue
-                    data = r.json()
-            except Exception:
-                continue
+    week = previous_completed_week()
+    kind = "tv" if content_type in ("series", "miniseries") else "movie"
 
-            candidates = []
-            for row in extract_rows(data):
-                name = get_value(row, "title", "name")
-                if not name:
-                    continue
-                normalized = normalize_title(name)
-                score = 0
-                for target in target_titles:
-                    if normalized == target:
-                        score = max(score, 100)
-                    elif normalized.startswith(target) or target.startswith(normalized):
-                        score = max(score, 80)
-                    elif target in normalized or normalized in target:
-                        score = max(score, 60)
-                if score:
-                    candidates.append((score, row))
+    country_path = "denmark/tv" if kind == "tv" else "denmark"
+    global_path = "tv" if kind == "tv" else "most-pop"
 
-            if not candidates:
-                continue
+    urls = [
+        f"https://www.netflix.com/tudum/top10/{country_path}?week={week}",
+        f"https://www.netflix.com/tudum/top10/{global_path}?week={week}",
+    ]
 
-            row = sorted(candidates, key=lambda x: x[0], reverse=True)[0][1]
-            rank = get_value(row, "rank", "ranking", "position")
-            views = get_value(row, "views", "viewCount", "view_count")
-            hours = get_value(row, "hoursViewed", "hours_viewed", "hoursWatched", "hours")
-            runtime = get_value(row, "runtime", "runtimeMinutes", "runtime_minutes")
-            weeks = get_value(row, "weeksInTop10", "weeks_in_top10", "weeks")
+    cache_key = (kind, normalize_title(title), week)
+    cached = NETFLIX_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < NETFLIX_CACHE_TTL:
+        return cached[1]
 
-            return {
-                "rank": int(rank) if str(rank or "").isdigit() else rank,
-                "views": _format_views(views),
-                "hours_viewed": _format_views(hours),
-                "runtime": runtime,
-                "weeks_in_top10": int(weeks) if str(weeks or "").isdigit() else weeks,
-                "week": week,
-                "source": "Netflix Top 10",
+    headers = {
+        "Accept": "text/html,application/xhtml+xml",
+        "User-Agent": "Mozilla/5.0",
+    }
+
+    async def fetch(url):
+        try:
+            async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
+                r = await client.get(url, headers=headers)
+                return clean_html(r.text) if not r.is_error else ""
+        except Exception:
+            return ""
+
+    country_text, global_text = await asyncio.gather(fetch(urls[0]), fetch(urls[1]))
+
+    candidates = [title, original_title]
+    country_ctx = title_context(country_text, candidates)
+    global_ctx = title_context(global_text, candidates)
+
+    result = {
+        "rank": parse_rank(country_ctx),
+        "views": parse_views(global_ctx),
+        "hours_viewed": parse_hours(global_ctx),
+        "week": week,
+        "source": "Netflix Top 10",
+    }
+
+    if result["rank"] is None and result["views"] is None and result["hours_viewed"] is None:
+        result = None
+
+    NETFLIX_CACHE[cache_key] = (time.time(), result)
+    return result
+               "source": "Netflix Top 10",
             }
 
     return None
