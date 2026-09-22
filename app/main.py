@@ -96,7 +96,10 @@ class _Top10HTMLParser(HTMLParser):
 
         if tag == "img":
             alt = (attrs.get("alt") or "").strip()
-            if alt:
+            # Tudum uses generic alt text such as "Image" for several
+            # decorative/CTA images between the poster and the rank marker.
+            # Keep the meaningful poster title instead.
+            if alt and alt.lower() not in {"image", "poster", "thumbnail"}:
                 self.last_image_alt = alt
 
         if tag == "tr":
@@ -127,7 +130,7 @@ class _Top10HTMLParser(HTMLParser):
 
         self.text_parts.append(value)
 
-        m = re.search(r"#\s*(10|[1-9])\s+in\s+(Movies|Shows)", value, re.I)
+        m = re.search(r"#\s*(10|[1-9])\s+in\s+(Movies|Shows)\b", value, re.I)
         if m and self.last_image_alt:
             self.image_rank_items.append({
                 "title": self.last_image_alt,
@@ -202,6 +205,27 @@ def parse_top10_html(html: str, region: str, media_type: str):
     # Current Tudum pages expose the title in poster alt text immediately
     # before the visible "#N in Movies/Shows" marker.
     wanted_category = "shows" if media_type == "tv" else "movies"
+
+    # Direct HTML fallback: pair a meaningful poster alt attribute with the
+    # following rank marker, allowing arbitrary tags/whitespace in between.
+    if not results:
+        direct_pattern = re.compile(
+            r'<img[^>]+alt=["\\\'](?!Image["\\\'])([^"\\\']+)["\\\'][^>]*>'
+            r'.{0,2500}?#\s*(10|[1-9])\s+in\s+'
+            r'(Movies|Shows)\\b',
+            re.I | re.S,
+        )
+        for match in direct_pattern.finditer(html):
+            if match.group(3).lower() != wanted_category:
+                continue
+            results.append({
+                "title": re.sub(r"\\s+", " ", match.group(1)).strip(),
+                "rank": int(match.group(2)),
+                "views": None,
+                "hours_viewed": None,
+                "runtime": None,
+            })
+
     if not results:
         for item in parser.image_rank_items:
             if item["category"] != wanted_category:
