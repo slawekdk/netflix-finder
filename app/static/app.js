@@ -10,3 +10,11 @@ async function search(){const btn=$("searchBtn");btn.disabled=true;$("status").t
 async function openDetails(type,id){const modal=$("modal"),content=$("modalContent");modal.classList.remove('hidden');modal.setAttribute('aria-hidden','false');content.innerHTML='<div class="loading">Ładowanie szczegółów…</div>';const media=type==='movie'?'movie':'tv';try{const r=await fetch(`${API}/title/${media}/${id}`);if(!r.ok)throw new Error(`HTTP ${r.status}`);const x=await r.json();content.innerHTML=`<div class="detail"><div>${x.poster_url?`<img src="${x.poster_url}" alt="${esc(x.title)}">`:''}</div><div><h3>${esc(x.title)}</h3><div class="detail-meta">${esc(x.year||'')} · ⭐ ${Number(x.rating||0).toFixed(1)} · ${fmt(x.vote_count)} głosów · ${x.type==='movie'?'Film':x.type==='miniseries'?'Miniserial':'Serial'}</div><p>${esc(x.overview||'Brak opisu.')}</p><a class="tmdb-link" target="_blank" rel="noopener" href="${x.tmdb_url}">Otwórz w TMDB ↗</a></div></div>`}catch(e){content.innerHTML='<div class="empty">Nie udało się pobrać szczegółów.</div>'}}
 function closeModal(){const m=$("modal");m.classList.add('hidden');m.setAttribute('aria-hidden','true')}
 $("searchBtn").addEventListener('click',search);document.querySelectorAll('[data-close]').forEach(x=>x.addEventListener('click',closeModal));document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()});search();
+
+const installHint=$("installHint");
+const dismissInstall=$("dismissInstall");
+if(installHint && dismissInstall){
+  if(window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone===true){installHint.classList.add("hidden");}
+  else if(!localStorage.getItem("nf_install_hint_dismissed")){installHint.classList.remove("hidden");}
+  dismissInstall.addEventListener("click",()=>{localStorage.setItem("nf_install_hint_dismissed","1");installHint.classList.add("hidden")});
+}

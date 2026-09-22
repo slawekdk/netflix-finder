@@ -6,6 +6,10 @@
   <meta name="theme-color" content="#0b0b0f">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Netflix Finder">
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="apple-touch-icon" href="/static/icon-180.png">
   <title>Netflix Finder</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -108,6 +112,7 @@
         <div id="resultCount" class="result-count"></div>
       </div>
       <div id="status" class="status"></div>
+      <div id="installHint" class="install-hint hidden">📱 Na iPhonie możesz dodać Netflix Finder do ekranu początkowego: <b>Udostępnij → Dodaj do ekranu początkowego</b><button id="dismissInstall" aria-label="Zamknij">×</button></div>
       <div id="results" class="results-grid"></div>
     </section>
 
@@ -123,5 +128,6 @@
   </div>
 
   <script src="/static/app.js"></script>
+  <script>if("serviceWorker" in navigator){window.addEventListener("load",()=>navigator.serviceWorker.register("/static/sw.js").catch(()=>{}));}</script>
 </body>
 </html>
