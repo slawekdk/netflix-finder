@@ -58,11 +58,19 @@ def normalize_title(value):
     return re.sub(r"\s+", " ", value).strip()
 
 def previous_week_date():
-    # Netflix weekly lists cover Monday-Sunday. Use a date in the most
-    # recently completed week so the endpoint resolves to a stable list.
+    # Netflix Top 10 weekly data is keyed by the Friday ending the
+    # published Monday-Sunday reporting week (e.g. 2026-09-11 for 9/7-9/13).
     today = date.today()
-    monday = today - timedelta(days=today.weekday())
-    return (monday - timedelta(days=7)).isoformat()
+    days_since_friday = (today.weekday() - 4) % 7
+    this_friday = today - timedelta(days=days_since_friday)
+    # If today is Friday, use the previous completed Friday.
+    if today.weekday() == 4:
+        this_friday -= timedelta(days=7)
+    return this_friday.isoformat()
+
+def candidate_week_dates():
+    first = date.fromisoformat(previous_week_date())
+    return [(first - timedelta(days=7*i)).isoformat() for i in range(6)]
 
 def _walk_rows(obj):
     """Find dicts that look like Netflix Top 10 rows in a nested response."""
@@ -110,61 +118,99 @@ def _format_views(value):
         return f"{n/1_000:.0f}K"
     return f"{int(n):,}"
 
-async def netflix_top10(region: str, content_type: str, title: str):
+async def netflix_top10(region: str, content_type: str, title: str, original_title: str = ""):
     """
-    Read Netflix's public Top 10 data endpoint. This is intentionally
-    best-effort: if Netflix changes the internal endpoint/schema, the
-    Finder simply returns no metrics instead of breaking title details.
+    Read Netflix's public Top 10 data endpoint on a best-effort basis.
+    Netflix has changed the public endpoint/schema over time, so try the
+    most recent completed weekly keys and a few known category variants.
     """
-    category = "films" if content_type == "movie" else "tv"
-    week = previous_week_date()
-    params = {"category": category, "region": region.upper(), "week": week}
-    headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
-    try:
-        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
-            r = await client.get(NETFLIX_TOP10_BASE, params=params, headers=headers)
-            if r.is_error:
-                return None
-            data = r.json()
-    except Exception:
+    categories = ["films", "tv"] if content_type != "movie" else ["films"]
+    titles = [title, original_title]
+    target_titles = {normalize_title(x) for x in titles if x}
+
+    def extract_rows(obj):
+        rows = []
+        if isinstance(obj, dict):
+            keys = {str(k).lower().replace("-", "").replace("_", "") for k in obj.keys()}
+            has_title = any(k in keys for k in ("title", "name"))
+            has_metric = any(k in keys for k in (
+                "views", "viewcount", "hoursviewed", "hours", "hourswatched"
+            ))
+            if has_title and has_metric:
+                rows.append(obj)
+            for value in obj.values():
+                rows.extend(extract_rows(value))
+        elif isinstance(obj, list):
+            for value in obj:
+                rows.extend(extract_rows(value))
+        return rows
+
+    def get_value(row, *wanted):
+        wanted_norm = {w.lower().replace("-", "").replace("_", "") for w in wanted}
+        for k, v in row.items():
+            if str(k).lower().replace("-", "").replace("_", "") in wanted_norm and v not in (None, ""):
+                return v
         return None
 
-    target = normalize_title(title)
-    candidates = []
-    for row in _walk_rows(data):
-        name = _first(row, "title", "name")
-        if not name:
-            continue
-        score = 0
-        normalized = normalize_title(name)
-        if normalized == target:
-            score = 100
-        elif normalized.startswith(target) or target.startswith(normalized):
-            score = 80
-        elif target in normalized or normalized in target:
-            score = 60
-        if score:
-            candidates.append((score, row))
+    for week in candidate_week_dates():
+        for category in categories:
+            params = {
+                "category": category,
+                "region": region.upper(),
+                "week": week,
+            }
+            headers = {
+                "Accept": "application/json, text/plain, */*",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+                "Referer": "https://www.netflix.com/tudum/top10/",
+            }
+            try:
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                    r = await client.get(NETFLIX_TOP10_BASE, params=params, headers=headers)
+                    if r.status_code >= 400:
+                        continue
+                    data = r.json()
+            except Exception:
+                continue
 
-    if not candidates:
-        return None
+            candidates = []
+            for row in extract_rows(data):
+                name = get_value(row, "title", "name")
+                if not name:
+                    continue
+                normalized = normalize_title(name)
+                score = 0
+                for target in target_titles:
+                    if normalized == target:
+                        score = max(score, 100)
+                    elif normalized.startswith(target) or target.startswith(normalized):
+                        score = max(score, 80)
+                    elif target in normalized or normalized in target:
+                        score = max(score, 60)
+                if score:
+                    candidates.append((score, row))
 
-    row = sorted(candidates, key=lambda x: x[0], reverse=True)[0][1]
-    rank = _first(row, "rank", "ranking", "position")
-    views = _first(row, "views")
-    hours = _first(row, "hoursViewed", "hours_viewed", "hours")
-    runtime = _first(row, "runtime")
-    weeks = _first(row, "weeksInTop10", "weeks_in_top10", "weeks")
+            if not candidates:
+                continue
 
-    return {
-        "rank": int(rank) if str(rank or "").isdigit() else rank,
-        "views": _format_views(views),
-        "hours_viewed": _format_views(hours),
-        "runtime": runtime,
-        "weeks_in_top10": int(weeks) if str(weeks or "").isdigit() else weeks,
-        "week": week,
-        "source": "Netflix Top 10",
-    }
+            row = sorted(candidates, key=lambda x: x[0], reverse=True)[0][1]
+            rank = get_value(row, "rank", "ranking", "position")
+            views = get_value(row, "views", "viewCount", "view_count")
+            hours = get_value(row, "hoursViewed", "hours_viewed", "hoursWatched", "hours")
+            runtime = get_value(row, "runtime", "runtimeMinutes", "runtime_minutes")
+            weeks = get_value(row, "weeksInTop10", "weeks_in_top10", "weeks")
+
+            return {
+                "rank": int(rank) if str(rank or "").isdigit() else rank,
+                "views": _format_views(views),
+                "hours_viewed": _format_views(hours),
+                "runtime": runtime,
+                "weeks_in_top10": int(weeks) if str(weeks or "").isdigit() else weeks,
+                "week": week,
+                "source": "Netflix Top 10",
+            }
+
+    return None
 
 @app.get("/health")
 async def health():
@@ -272,7 +318,7 @@ async def get_title(media_type: Literal["movie", "tv"], tmdb_id: int):
     providers = details.get("watch/providers", {}).get("results", {}).get(region, {})
     netflix = [p for p in providers.get("flatrate", []) if p.get("provider_id") == NETFLIX_PROVIDER_ID]
 
-    netflix_data = await netflix_top10(region, "movie" if media_type == "movie" else "series", title)
+    netflix_data = await netflix_top10(\n        region,\n        "movie" if media_type == "movie" else "series",\n        title,\n        details.get("original_title") or details.get("original_name") or "",\n    )
 
     return {
         "id": details.get("id"),
