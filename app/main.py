@@ -87,9 +87,18 @@ class _Top10HTMLParser(HTMLParser):
         self.current_row = []
         self.rows = []
         self.text_parts = []
+        self.last_image_alt = None
+        self.image_rank_items = []
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
+        attrs = dict(attrs)
+
+        if tag == "img":
+            alt = (attrs.get("alt") or "").strip()
+            if alt:
+                self.last_image_alt = alt
+
         if tag == "tr":
             self.in_tr = True
             self.current_row = []
@@ -100,7 +109,7 @@ class _Top10HTMLParser(HTMLParser):
     def handle_endtag(self, tag):
         tag = tag.lower()
         if tag in ("td", "th") and self.in_cell:
-            value = re.sub(r"\\s+", " ", " ".join(self.current_cell)).strip()
+            value = re.sub(r"\s+", " ", " ".join(self.current_cell)).strip()
             self.current_row.append(value)
             self.in_cell = False
         elif tag == "tr" and self.in_tr:
@@ -111,15 +120,26 @@ class _Top10HTMLParser(HTMLParser):
             self.text_parts.append("\n")
 
     def handle_data(self, data):
+        value = data.strip()
+
         if self.in_cell:
-            self.current_cell.append(data.strip())
-        self.text_parts.append(data.strip())
+            self.current_cell.append(value)
+
+        self.text_parts.append(value)
+
+        m = re.search(r"#\s*(10|[1-9])\s+in\s+(Movies|Shows)", value, re.I)
+        if m and self.last_image_alt:
+            self.image_rank_items.append({
+                "title": self.last_image_alt,
+                "rank": int(m.group(1)),
+                "category": m.group(2).lower(),
+            })
 
 
 def parse_top10_html(html: str, region: str, media_type: str):
     parser = _Top10HTMLParser()
     parser.feed(html)
-    text = re.sub(r"\\s+", " ", " ".join(parser.text_parts)).strip()
+    text = re.sub(r"\s+", " ", " ".join(parser.text_parts)).strip()
 
     # Netflix currently exposes the selected week in the page text.
     week = None
@@ -179,26 +199,20 @@ def parse_top10_html(html: str, region: str, media_type: str):
                 "runtime": runtime,
             })
 
-    # Fallback: parse the visible "#N in Movies/Shows" blocks.
+    # Current Tudum pages expose the title in poster alt text immediately
+    # before the visible "#N in Movies/Shows" marker.
+    wanted_category = "shows" if media_type == "tv" else "movies"
     if not results:
-        pattern = re.compile(
-            r"(?:Image#|Image\s*)\s*(10|[1-9])\s+in\s+(?:Movies|Shows)",
-            re.I
-        )
-        matches = list(pattern.finditer(text))
-        for match in matches:
-            rank = int(match.group(1))
-            before = text[max(0, match.start() - 400):match.start()]
-            lines = [x.strip() for x in before.splitlines() if x.strip()]
-            title = lines[-1] if lines else None
-            if title:
-                results.append({
-                    "title": title,
-                    "rank": rank,
-                    "views": None,
-                    "hours_viewed": None,
-                    "runtime": None,
-                })
+        for item in parser.image_rank_items:
+            if item["category"] != wanted_category:
+                continue
+            results.append({
+                "title": item["title"],
+                "rank": item["rank"],
+                "views": None,
+                "hours_viewed": None,
+                "runtime": None,
+            })
 
     # Deduplicate and sort.
     unique = {}
