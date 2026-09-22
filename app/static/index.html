@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0b0f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Netflix Finder</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="app-shell">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">NETFLIX FINDER</div>
+        <h1>Znajdź coś dobrego.</h1>
+        <p>Filtruj katalog Netflix według kraju, typu, oceny i liczby głosów.</p>
+      </div>
+      <div class="netflix-badge">N</div>
+    </header>
+
+    <section class="filters card">
+      <div class="field wide">
+        <label for="country">Kraj produkcji</label>
+        <select id="country">
+          <option value="">Wszystkie kraje</option>
+          <option value="KR">🇰🇷 Korea Południowa</option>
+          <option value="DK">🇩🇰 Dania</option>
+          <option value="US">🇺🇸 USA</option>
+          <option value="GB">🇬🇧 Wielka Brytania</option>
+          <option value="DE">🇩🇪 Niemcy</option>
+          <option value="FR">🇫🇷 Francja</option>
+          <option value="ES">🇪🇸 Hiszpania</option>
+          <option value="IT">🇮🇹 Włochy</option>
+          <option value="JP">🇯🇵 Japonia</option>
+          <option value="IN">🇮🇳 Indie</option>
+          <option value="CA">🇨🇦 Kanada</option>
+          <option value="AU">🇦🇺 Australia</option>
+          <option value="SE">🇸🇪 Szwecja</option>
+          <option value="NO">🇳🇴 Norwegia</option>
+          <option value="PL">🇵🇱 Polska</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="type">Typ</label>
+        <select id="type">
+          <option value="all">Wszystko</option>
+          <option value="movie">Filmy</option>
+          <option value="series">Seriale</option>
+          <option value="miniseries">Miniseriale</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="rating">Min. ocena</label>
+        <select id="rating">
+          <option value="0">Bez minimum</option>
+          <option value="6">6.0+</option>
+          <option value="6.5">6.5+</option>
+          <option value="7">7.0+</option>
+          <option value="7.5" selected>7.5+</option>
+          <option value="8">8.0+</option>
+          <option value="8.5">8.5+</option>
+          <option value="9">9.0+</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="votes">Min. głosów</label>
+        <select id="votes">
+          <option value="0">Bez minimum</option>
+          <option value="1000">1 000+</option>
+          <option value="5000">5 000+</option>
+          <option value="10000" selected>10 000+</option>
+          <option value="25000">25 000+</option>
+          <option value="50000">50 000+</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="sort">Sortowanie</label>
+        <select id="sort">
+          <option value="rating" selected>⭐ Ocena</option>
+          <option value="votes">👥 Liczba głosów</option>
+          <option value="popularity">🔥 Popularność</option>
+        </select>
+      </div>
+
+      <div class="field small">
+        <label for="limit">Wyników</label>
+        <select id="limit">
+          <option value="10" selected>10</option>
+          <option value="20">20</option>
+        </select>
+      </div>
+
+      <button id="searchBtn" class="search-btn">Szukaj</button>
+    </section>
+
+    <section class="results-section">
+      <div class="results-head">
+        <div>
+          <div class="eyebrow">WYNIKI</div>
+          <h2 id="resultsTitle">TOP 10</h2>
+        </div>
+        <div id="resultCount" class="result-count"></div>
+      </div>
+      <div id="status" class="status"></div>
+      <div id="results" class="results-grid"></div>
+    </section>
+
+    <footer>Netflix Finder · dane katalogowe: TMDB / JustWatch</footer>
+  </main>
+
+  <div id="modal" class="modal hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-close></div>
+    <article class="modal-card">
+      <button class="close" data-close aria-label="Zamknij">×</button>
+      <div id="modalContent"></div>
+    </article>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
