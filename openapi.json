@@ -1,0 +1,31 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Netflix Finder", "version": "1.0.0"},
+  "servers": [{"url": "https://YOUR-HOST.example.com"}],
+  "paths": {
+    "/search": {
+      "get": {
+        "operationId": "searchNetflix",
+        "summary": "Find Netflix titles by country, type and quality criteria",
+        "parameters": [
+          {"name":"production_country","in":"query","schema":{"type":"string"},"description":"ISO country code such as KR, DK, US"},
+          {"name":"content_type","in":"query","required":false,"schema":{"type":"string","enum":["movie","series","miniseries","all"],"default":"all"}},
+          {"name":"min_rating","in":"query","required":false,"schema":{"type":"number","minimum":0,"maximum":10,"default":0}},
+          {"name":"min_votes","in":"query","required":false,"schema":{"type":"integer","minimum":0,"default":0}},
+          {"name":"sort","in":"query","required":false,"schema":{"type":"string","enum":["rating","votes","popularity"],"default":"rating"}},
+          {"name":"region","in":"query","required":false,"schema":{"type":"string","minLength":2,"maxLength":2,"default":"DK"}},
+          {"name":"page","in":"query","required":false,"schema":{"type":"integer","minimum":1,"default":1}},
+          {"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":20,"default":10}}
+        ],
+        "responses": {"200":{"description":"Search results"}}
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Health check",
+        "responses": {"200":{"description":"Service status"}}
+      }
+    }
+  }
+}
