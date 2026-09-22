@@ -459,6 +459,16 @@ def search(
     }
 
 
+@app.get("/top10")
+def top10_debug(
+    region: str = DEFAULT_REGION,
+    media_type: str = "movie",
+):
+    """Return parsed Netflix Tudum Top 10 data for diagnostics."""
+    media_type = "tv" if media_type.lower() in ("tv", "series", "shows") else "movie"
+    return get_top10(region.upper(), media_type)
+
+
 @app.get("/lookup")
 def lookup(
     title: str = Query(..., min_length=1),
